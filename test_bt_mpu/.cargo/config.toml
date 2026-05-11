@@ -1,0 +1,15 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+rustflags = [
+    # Tell the linker to use the memory layout from cortex-m-rt
+    "-C", "link-arg=-Tlink.x",
+    
+    # Tell the linker to include the defmt logging sections
+    "-C", "link-arg=-Tdefmt.x",
+]
+runner = "probe-rs run --chip STM32U545RETxQ"
+
+[env]
+DEFMT_LOG = "debug"
