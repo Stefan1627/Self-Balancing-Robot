@@ -2,4 +2,4 @@
 /test_full/target
 /test_mpu/target
 /test_motors/target
-
+/test_lqr/target

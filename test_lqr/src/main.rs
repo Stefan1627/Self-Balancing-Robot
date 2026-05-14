@@ -11,11 +11,10 @@ use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
 
-use core::fmt::Write;
-use core::sync::atomic::Ordering;
+use core::fmt::Write as _;
 
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
+use embassy_futures::join::join3;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::i2c::{Config as I2cConfig, I2c};
 use embassy_stm32::time::Hertz;
@@ -23,7 +22,6 @@ use embassy_stm32::usart::{Config as UartConfig, Uart};
 use embassy_stm32::{bind_interrupts, i2c, peripherals, usart};
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
 use embassy_stm32::timer::Channel;
-use embassy_time::{Delay, Duration, Ticker, Timer};
 
 use embedded_hal::Pwm;
 
@@ -32,14 +30,14 @@ use mpu6050_dmp::quaternion::Quaternion;
 use mpu6050_dmp::sensor::Mpu6050;
 use mpu6050_dmp::yaw_pitch_roll::YawPitchRoll;
 
-use embassy_futures::join::join;
-use embassy_time::{Delay, Duration, Ticker, Timer};
+use embassy_time::{Delay, Duration, Ticker};
 
 use commands::{
-    balance_enabled, disable_balance, handle_bluetooth_byte, velocity_reference_mps,
+    balance_enabled, disable_balance, handle_bluetooth_byte, motor_cmd, velocity_reference_mps,
 };
 use lqr::LqrController;
 use motor::{velocity_to_motor_command, MotorCommand};
+use telemetry::{read_telem, update_telem, UartBuf};
 
 bind_interrupts!(struct Irqs {
     I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
@@ -58,21 +56,20 @@ async fn main(_spawner: Spawner) {
 
     // 1. Initialize Motor GPIOs
     let mut en_motors = Output::new(p.PA4, Level::High, Speed::Low);
-    let mut dir_left = Output::new(p.PA1, Level::Low, Speed::VeryHigh);
-    let mut dir_right = Output::new(p.PA3, Level::Low, Speed::VeryHigh);
+    let mut dir_left  = Output::new(p.PA1, Level::Low,  Speed::VeryHigh);
+    let mut dir_right = Output::new(p.PA3, Level::Low,  Speed::VeryHigh);
 
-    // STEP pins moved to Hardware PWM (TIM2)
-    // --- FIX 2: Updated to the modern Embassy PwmPin::new API ---
+    // STEP pins → Hardware PWM (TIM2)
     let ch2 = PwmPin::new(p.PB3, embassy_stm32::gpio::OutputType::PushPull);
     let ch3 = PwmPin::new(p.PA2, embassy_stm32::gpio::OutputType::PushPull);
-    
+
     let mut pwm = SimplePwm::new(
         p.TIM2,
-        None,      
-        Some(ch2), 
-        Some(ch3), 
-        None,      
-        Hertz(2000), // 2000 Hz = 500us between steps
+        None,
+        Some(ch2),
+        Some(ch3),
+        None,
+        Hertz(2000),
         Default::default(),
     );
 
@@ -119,8 +116,11 @@ async fn main(_spawner: Spawner) {
 
     info!("Initialization complete. Starting concurrent loops...");
 
+    // ==========================================
+    // LOOP 1: BLUETOOTH RECEIVER (App → Robot)
+    // ==========================================
     let receiver_loop = async {
-    let mut buf = [0u8; 1];
+        let mut buf = [0u8; 1];
 
         loop {
             if rx.read(&mut buf).await.is_ok() {
@@ -129,22 +129,27 @@ async fn main(_spawner: Spawner) {
         }
     };
 
+    // ==========================================
+    // LOOP 2: LQR CONTROL
+    // ==========================================
     let control_loop = async {
         let mut ticker = Ticker::every(Duration::from_millis(config::CONTROL_PERIOD_MS));
         let mut lqr = LqrController::new();
 
+        // --- Motor state tracking (like test_full) ---
+        // Avoids re-initialising PWM every tick, which disrupts stepper pulses.
+        let mut motor_running = false;
+        let mut motor_forward = true;
+        let mut current_hz: u32 = 0;
+
         loop {
             ticker.next().await;
 
-            if !balance_enabled() {
-                pwm.disable(Channel::Ch2);
-                pwm.disable(Channel::Ch3);
-                en_motors.set_high();
-                lqr.reset();
-                continue;
-            }
-
-            let mut latest_pitch_rad: Option<f32> = None;
+            // ----------------------------------------------------------
+            // ALWAYS read IMU so the phone sees live data even when
+            // the balancing controller is disabled.
+            // ----------------------------------------------------------
+            let mut latest_ypr: Option<YawPitchRoll> = None;
 
             if let Ok(mut len) = sensor.get_fifo_count() {
                 let mut fifo_buf = [0u8; 28];
@@ -153,62 +158,173 @@ async fn main(_spawner: Spawner) {
                     if sensor.read_fifo(&mut fifo_buf).is_ok() {
                         if let Some(quat) = Quaternion::from_bytes(&fifo_buf[..16]) {
                             let quat = quat.normalize();
-                            let ypr = YawPitchRoll::from(quat);
-
-                            latest_pitch_rad = Some(ypr.pitch as f32);
+                            latest_ypr = Some(YawPitchRoll::from(quat));
                         }
                     }
-
                     len -= 28;
                 }
             }
 
-            let Some(theta_rad) = latest_pitch_rad else {
-                continue;
-            };
-
             let v_ref_mps = velocity_reference_mps();
 
-            let Some(v_cmd_mps) = lqr.step(theta_rad, v_ref_mps) else {
-                pwm.disable(Channel::Ch2);
-                pwm.disable(Channel::Ch3);
-                en_motors.set_high();
-                disable_balance();
-                continue;
+            // Only read accelerometer when we got fresh FIFO data —
+            // avoids an extra I2C transaction every 5 ms (same as test_full).
+            let mut ax: i16 = 0;
+            let mut ay: i16 = 0;
+            let mut az: i16 = 0;
+
+            if let Some(ref ypr) = latest_ypr {
+                if let Ok(accel) = sensor.accel() {
+                    ax = accel.x();
+                    ay = accel.y();
+                    az = accel.z();
+                }
+
+                update_telem(
+                    ypr.yaw as f32, ypr.pitch as f32, ypr.roll as f32,
+                    ax, ay, az,
+                    0.0, v_ref_mps, balance_enabled(),
+                );
+            }
+
+            // ----------------------------------------------------------
+            // Determine MotorCommand based on balance mode
+            // ----------------------------------------------------------
+            let motor_command = if balance_enabled() {
+                let Some(ypr) = latest_ypr else {
+                    continue;
+                };
+
+                let theta_rad = ypr.roll as f32;
+
+                match lqr.step(theta_rad, v_ref_mps) {
+                    Some(v_cmd_mps) => {
+                        // Overwrite with LQR velocity now that we have it
+                        update_telem(
+                            ypr.yaw as f32, ypr.pitch as f32, ypr.roll as f32,
+                            ax, ay, az,
+                            v_cmd_mps, v_ref_mps, true,
+                        );
+
+                        velocity_to_motor_command(v_cmd_mps)
+                    }
+                    None => {
+                        disable_balance();
+                        MotorCommand::DisableDrivers
+                    }
+                }
+            } else {
+                lqr.reset();
+                let cmd = motor_cmd();
+                match cmd {
+                    1 => MotorCommand::Run { forward: true, step_hz: 4000 },
+                    2 => MotorCommand::Run { forward: false, step_hz: 4000 },
+                    _ => MotorCommand::DisableDrivers,
+                }
             };
 
-            match velocity_to_motor_command(v_cmd_mps) {
-                MotorCommand::StopPulses => {
-                    // Keep drivers enabled for holding torque, but stop motion.
-                    en_motors.set_low();
-                    pwm.disable(Channel::Ch2);
-                    pwm.disable(Channel::Ch3);
+            // ----------------------------------------------------------
+            // Motor output — with state tracking & acceleration ramp
+            // matching test_full's smooth behaviour.
+            // ----------------------------------------------------------
+            match motor_command {
+                MotorCommand::DisableDrivers => {
+                    en_motors.set_high(); // disable drivers
+                    if motor_running {
+                        pwm.disable(Channel::Ch2);
+                        pwm.disable(Channel::Ch3);
+                        motor_running = false;
+                    }
+                    current_hz = 0;
                 }
-                MotorCommand::Run { forward, step_hz } => {
+                MotorCommand::StopPulses => {
+                    en_motors.set_low(); // holding torque
+                    if motor_running {
+                        pwm.disable(Channel::Ch2);
+                        pwm.disable(Channel::Ch3);
+                        motor_running = false;
+                    }
+                    current_hz = 0;
+                }
+                MotorCommand::Run { forward, step_hz: target_hz } => {
                     en_motors.set_low();
 
-                    if forward {
-                        dir_left.set_high();
-                        dir_right.set_low();
-                    } else {
-                        dir_left.set_low();
-                        dir_right.set_high();
+                    // Direction change → must stop pulses first, then restart
+                    if motor_running && forward != motor_forward {
+                        pwm.disable(Channel::Ch2);
+                        pwm.disable(Channel::Ch3);
+                        motor_running = false;
+                        current_hz = 0;
                     }
 
-                    embassy_time::block_for(Duration::from_micros(2));
+                    // Set direction pins (only meaningful change on direction flip)
+                    if forward != motor_forward || !motor_running {
+                        motor_forward = forward;
 
-                    pwm.set_frequency(Hertz(step_hz));
+                        let left_fwd  = forward ^ config::INVERT_LEFT_MOTOR;
+                        let right_fwd = forward ^ config::INVERT_RIGHT_MOTOR;
 
-                    let max_duty = pwm.get_max_duty();
-                    pwm.set_duty(Channel::Ch2, max_duty / 2);
-                    pwm.set_duty(Channel::Ch3, max_duty / 2);
+                        if left_fwd  { dir_left.set_high();  } else { dir_left.set_low();  }
+                        if right_fwd { dir_right.set_low();  } else { dir_right.set_high(); }
 
-                    pwm.enable(Channel::Ch2);
-                    pwm.enable(Channel::Ch3);
+                        embassy_time::block_for(Duration::from_micros(2));
+                    }
+
+                    // Acceleration ramp — limit how fast frequency increases,
+                    // just like test_full's accel_step.  Deceleration is instant
+                    // (stepper can always slow down safely).
+                    let new_hz = if current_hz < target_hz {
+                        // Ramp up
+                        (current_hz + config::ACCEL_STEP_HZ).min(target_hz)
+                    } else {
+                        // Ramp down (instant is fine for steppers)
+                        target_hz
+                    };
+
+                    // Only touch the PWM hardware when something changed
+                    if new_hz != current_hz || !motor_running {
+                        current_hz = new_hz;
+
+                        pwm.set_frequency(Hertz(current_hz));
+
+                        let max_duty = pwm.get_max_duty();
+                        pwm.set_duty(Channel::Ch2, max_duty / 2);
+                        pwm.set_duty(Channel::Ch3, max_duty / 2);
+
+                        if !motor_running {
+                            pwm.enable(Channel::Ch2);
+                            pwm.enable(Channel::Ch3);
+                            motor_running = true;
+                        }
+                    }
                 }
             }
         }
     };
 
-    join(control_loop, receiver_loop).await;
+    // ==========================================
+    // LOOP 3: TELEMETRY (Robot → Phone)
+    // Same format as test_full — raw radians + raw accel.
+    // ==========================================
+    let telemetry_loop = async {
+        let mut uart_buf = UartBuf::new();
+        let mut ticker = Ticker::every(Duration::from_millis(config::TELEMETRY_PERIOD_MS));
+
+        loop {
+            ticker.next().await;
+
+            let t = read_telem();
+
+            uart_buf.clear();
+            let _ = core::write!(
+                &mut uart_buf,
+                "Y: {:.2}, P: {:.2}, R: {:.2} | Ax: {}, Ay: {}, Az: {}\r\n",
+                t.yaw_rad, t.pitch_rad, t.roll_rad, t.ax, t.ay, t.az
+            );
+
+            let _ = tx.write(uart_buf.as_slice()).await;
+        }
+    };
+
+    join3(control_loop, receiver_loop, telemetry_loop).await;
 }
