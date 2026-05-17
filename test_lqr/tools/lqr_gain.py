@@ -55,7 +55,7 @@ B = np.array([
 Q = np.diag([
     2.0,    # theta
     0.05,   # theta_dot
-    0.0,    # position
+    1e-4,    # position
     1.0,    # velocity
 ])
 

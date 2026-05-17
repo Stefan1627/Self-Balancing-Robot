@@ -6,6 +6,7 @@ use crate::config::{
 use crate::lqr::clampf;
 
 pub enum MotorCommand {
+    DisableDrivers,
     StopPulses,
     Run {
         forward: bool,
