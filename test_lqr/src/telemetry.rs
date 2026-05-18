@@ -4,29 +4,22 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
-// Shared telemetry state — written by the control loop, read by the UART loop
+// Shared telemetry state: written by control loop, read by UART loop.
 // ---------------------------------------------------------------------------
 
-/// Yaw / Pitch / Roll in radians (f32 stored as raw bits via AtomicU32).
-pub static TELEM_YAW_BITS:   AtomicU32 = AtomicU32::new(0);
+pub static TELEM_YAW_BITS: AtomicU32 = AtomicU32::new(0);
 pub static TELEM_PITCH_BITS: AtomicU32 = AtomicU32::new(0);
-pub static TELEM_ROLL_BITS:  AtomicU32 = AtomicU32::new(0);
+pub static TELEM_ROLL_BITS: AtomicU32 = AtomicU32::new(0);
 
-/// Raw accelerometer readings (i16 from the MPU, stored as i32 in atomics).
 pub static TELEM_AX: AtomicI32 = AtomicI32::new(0);
 pub static TELEM_AY: AtomicI32 = AtomicI32::new(0);
 pub static TELEM_AZ: AtomicI32 = AtomicI32::new(0);
 
-/// LQR-commanded body velocity in m/s.
 pub static TELEM_V_CMD_BITS: AtomicU32 = AtomicU32::new(0);
-
-/// Velocity reference from the app (forward/backward setpoint) in m/s.
 pub static TELEM_V_REF_BITS: AtomicU32 = AtomicU32::new(0);
 
-/// True when the balancing controller is active.
 pub static TELEM_BALANCED: AtomicBool = AtomicBool::new(false);
 
-/// Called from the control loop every tick to publish the current IMU + LQR state.
 #[allow(clippy::too_many_arguments)]
 pub fn update_telem(
     yaw_rad: f32,
@@ -39,46 +32,51 @@ pub fn update_telem(
     v_ref_mps: f32,
     balanced: bool,
 ) {
-    TELEM_YAW_BITS.store(yaw_rad.to_bits(),   Ordering::Relaxed);
+    TELEM_YAW_BITS.store(yaw_rad.to_bits(), Ordering::Relaxed);
     TELEM_PITCH_BITS.store(pitch_rad.to_bits(), Ordering::Relaxed);
-    TELEM_ROLL_BITS.store(roll_rad.to_bits(),  Ordering::Relaxed);
+    TELEM_ROLL_BITS.store(roll_rad.to_bits(), Ordering::Relaxed);
+
     TELEM_AX.store(ax as i32, Ordering::Relaxed);
     TELEM_AY.store(ay as i32, Ordering::Relaxed);
     TELEM_AZ.store(az as i32, Ordering::Relaxed);
+
     TELEM_V_CMD_BITS.store(v_cmd_mps.to_bits(), Ordering::Relaxed);
     TELEM_V_REF_BITS.store(v_ref_mps.to_bits(), Ordering::Relaxed);
+
     TELEM_BALANCED.store(balanced, Ordering::Relaxed);
 }
 
 pub struct Telemetry {
-    pub yaw_rad:   f32,
+    pub yaw_rad: f32,
     pub pitch_rad: f32,
-    pub roll_rad:  f32,
+    pub roll_rad: f32,
     pub ax: i32,
     pub ay: i32,
     pub az: i32,
     pub v_cmd_mps: f32,
     pub v_ref_mps: f32,
-    pub balanced:  bool,
+    pub balanced: bool,
 }
 
-/// Read the latest telemetry snapshot.
 pub fn read_telem() -> Telemetry {
     Telemetry {
-        yaw_rad:   f32::from_bits(TELEM_YAW_BITS.load(Ordering::Relaxed)),
+        yaw_rad: f32::from_bits(TELEM_YAW_BITS.load(Ordering::Relaxed)),
         pitch_rad: f32::from_bits(TELEM_PITCH_BITS.load(Ordering::Relaxed)),
-        roll_rad:  f32::from_bits(TELEM_ROLL_BITS.load(Ordering::Relaxed)),
+        roll_rad: f32::from_bits(TELEM_ROLL_BITS.load(Ordering::Relaxed)),
+
         ax: TELEM_AX.load(Ordering::Relaxed),
         ay: TELEM_AY.load(Ordering::Relaxed),
         az: TELEM_AZ.load(Ordering::Relaxed),
+
         v_cmd_mps: f32::from_bits(TELEM_V_CMD_BITS.load(Ordering::Relaxed)),
         v_ref_mps: f32::from_bits(TELEM_V_REF_BITS.load(Ordering::Relaxed)),
-        balanced:  TELEM_BALANCED.load(Ordering::Relaxed),
+
+        balanced: TELEM_BALANCED.load(Ordering::Relaxed),
     }
 }
 
 // ---------------------------------------------------------------------------
-// UART string buffer
+// UART string buffer.
 // ---------------------------------------------------------------------------
 
 pub struct UartBuf {
@@ -88,7 +86,10 @@ pub struct UartBuf {
 
 impl UartBuf {
     pub const fn new() -> Self {
-        Self { buf: [0; 128], len: 0 }
+        Self {
+            buf: [0; 128],
+            len: 0,
+        }
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -104,11 +105,14 @@ impl Write for UartBuf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let bytes = s.as_bytes();
         let remaining = self.buf.len() - self.len;
+
         if bytes.len() > remaining {
             return Err(core::fmt::Error);
         }
+
         self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
         self.len += bytes.len();
+
         Ok(())
     }
 }

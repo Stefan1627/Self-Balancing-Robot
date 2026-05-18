@@ -11,11 +11,11 @@ from scipy.linalg import solve_discrete_are
 g = 9.81
 
 # Total robot mass in kg.
-m = 1.20
+m = 1.35
 
 # Distance from wheel axle to center of gravity in meters.
 # Measure with battery and all electronics mounted.
-l = 0.080
+l = 0.0725
 
 # Firmware control loop period.
 dt = 0.005  # 200 Hz
@@ -53,16 +53,16 @@ B = np.array([
 # Keep Q[2,2] near zero until you have wheel encoders.
 # Increase Q[3,3] for tighter velocity control.
 Q = np.diag([
-    2.0,    # theta
-    0.05,   # theta_dot
-    1e-4,    # position
-    1.0,    # velocity
+    300.0,    # theta
+    1.50,   # theta_dot
+    1e-6,    # position
+    2.5,    # velocity
 ])
 
 # Penalize control effort.
 # Higher R = softer, less aggressive.
 # Lower R = more aggressive.
-R = np.array([[2.0]])
+R = np.array([[0.05]])
 
 C = np.eye(4)
 D = np.zeros((4, 1))

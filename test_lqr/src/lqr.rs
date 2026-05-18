@@ -1,8 +1,9 @@
 // src/lqr.rs
 
 use crate::config::{
-    DT_S, FALL_LIMIT_RAD, LQR_K, MASS_KG, MAX_FORCE_N, MAX_SPEED_MPS, MOTOR_SIGN, THETA_SIGN,
-    THETA_ZERO_RAD,
+    DT_S, FALL_LIMIT_RAD, LQR_K, MASS_KG, MAX_ACCEL_MPS2, MAX_FORCE_N, MAX_SPEED_MPS,
+    MOTOR_SIGN, THETA_SIGN, THETA_ZERO_RAD, TILT_ACCEL_BOOST_DEADBAND_RAD,
+    TILT_ACCEL_BOOST_GAIN,
 };
 
 #[inline]
@@ -57,8 +58,9 @@ impl LqrController {
         self.initialized = true;
 
         // Derivative low-pass filter.
-        // Increase alpha for faster derivative, decrease for smoother derivative.
-        const D_ALPHA: f32 = 0.35;
+        // Faster than the previous 0.35 value.
+        // If the robot becomes noisy or oscillatory, reduce to 0.45.
+        const D_ALPHA: f32 = 0.55;
         self.theta_dot_rad_s += D_ALPHA * (theta_dot_raw - self.theta_dot_rad_s);
 
         let e_theta = theta_rad;
@@ -77,7 +79,22 @@ impl LqrController {
 
         let force_n = clampf(force_n, -MAX_FORCE_N, MAX_FORCE_N);
 
-        let accel_mps2 = force_n / MASS_KG;
+        let mut accel_mps2 = force_n / MASS_KG;
+
+        // Nonlinear early-tilt acceleration boost.
+        // This makes the wheels accelerate harder as soon as the body starts falling.
+        let theta_abs = theta_rad.abs();
+
+        if theta_abs > TILT_ACCEL_BOOST_DEADBAND_RAD {
+            let boost = TILT_ACCEL_BOOST_GAIN
+                * (theta_abs - TILT_ACCEL_BOOST_DEADBAND_RAD);
+
+            accel_mps2 += boost * theta_rad.signum();
+        }
+
+        // Final acceleration clamp.
+        // This keeps LQR + boost inside the physical acceleration limit.
+        accel_mps2 = clampf(accel_mps2, -MAX_ACCEL_MPS2, MAX_ACCEL_MPS2);
 
         self.v_mps += accel_mps2 * DT_S;
         self.v_mps = clampf(self.v_mps, -MAX_SPEED_MPS, MAX_SPEED_MPS);

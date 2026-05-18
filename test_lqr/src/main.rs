@@ -12,17 +12,18 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU8, Ordering}; // <--- ADDED for Buzzer state
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_executor::Spawner;
-use embassy_futures::join::join4; // <--- CHANGED to join4
+use embassy_futures::join::join4;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::i2c::{Config as I2cConfig, I2c};
 use embassy_stm32::time::Hertz;
-use embassy_stm32::usart::{Config as UartConfig, Uart};
-use embassy_stm32::{bind_interrupts, i2c, peripherals, usart};
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
 use embassy_stm32::timer::Channel;
+use embassy_stm32::usart::{Config as UartConfig, Uart};
+use embassy_stm32::{bind_interrupts, i2c, peripherals, usart};
+use embassy_time::{Delay, Duration, Ticker, Timer};
 
 use embedded_hal::Pwm;
 
@@ -30,8 +31,6 @@ use mpu6050_dmp::address::Address;
 use mpu6050_dmp::quaternion::Quaternion;
 use mpu6050_dmp::sensor::Mpu6050;
 use mpu6050_dmp::yaw_pitch_roll::YawPitchRoll;
-
-use embassy_time::{Delay, Duration, Ticker, Timer}; // <--- ADDED Timer for buzzer async delays
 
 use commands::{
     balance_enabled, disable_balance, handle_bluetooth_byte, motor_cmd, velocity_reference_mps,
@@ -46,27 +45,28 @@ bind_interrupts!(struct Irqs {
     USART3 => usart::InterruptHandler<peripherals::USART3>;
 });
 
-// --- GLOBAL BUZZER COMMAND ---
-// 0 = Idle
-// 1 = Single Beep (Stop event)
-// 2 = Double Beep (Calibrated event)
+// Buzzer command.
+// 0 = idle
+// 1 = single beep, balance stopped
+// 2 = double beep, upright/calibrated
+// 3 = long beep, fall detected
 static BUZZER_CMD: AtomicU8 = AtomicU8::new(0);
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let mut config = embassy_stm32::Config::default();
-    config.rcc.hsi = true;
-    config.rcc.sys = embassy_stm32::rcc::Sysclk::HSI;
-    let p = embassy_stm32::init(config);
+    let mut stm32_config = embassy_stm32::Config::default();
+    stm32_config.rcc.hsi = true;
+    stm32_config.rcc.sys = embassy_stm32::rcc::Sysclk::HSI;
+    let p = embassy_stm32::init(stm32_config);
 
     info!("Robot Booting: Initializing Peripherals...");
 
-    // 1. Initialize Motor GPIOs
+    // 1. Motor GPIOs.
     let mut en_motors = Output::new(p.PA4, Level::High, Speed::Low);
-    let mut dir_left  = Output::new(p.PA1, Level::Low,  Speed::VeryHigh);
-    let mut dir_right = Output::new(p.PA3, Level::Low,  Speed::VeryHigh);
+    let mut dir_left = Output::new(p.PA1, Level::Low, Speed::VeryHigh);
+    let mut dir_right = Output::new(p.PA3, Level::Low, Speed::VeryHigh);
 
-    // STEP pins → Hardware PWM (TIM2)
+    // STEP pins -> hardware PWM, TIM2.
     let ch2 = PwmPin::new(p.PB3, embassy_stm32::gpio::OutputType::PushPull);
     let ch3 = PwmPin::new(p.PA2, embassy_stm32::gpio::OutputType::PushPull);
 
@@ -80,23 +80,36 @@ async fn main(_spawner: Spawner) {
         Default::default(),
     );
 
-    // 2. Initialize UART (HC-06 Bluetooth)
+    // 2. UART, HC-06 Bluetooth.
     let mut uart_config = UartConfig::default();
     uart_config.baudrate = 9600;
 
     let hc06 = Uart::new(
-        p.USART3, p.PA5, p.PB10, Irqs, p.GPDMA1_CH2, p.GPDMA1_CH3, uart_config,
-    ).expect("Failed to initialize UART");
+        p.USART3,
+        p.PA5,
+        p.PB10,
+        Irqs,
+        p.GPDMA1_CH2,
+        p.GPDMA1_CH3,
+        uart_config,
+    )
+    .expect("Failed to initialize UART");
 
     let (mut tx, mut rx) = hc06.split();
     let _ = tx.write(b"--- Robot Online ---\r\n").await;
 
-    // 3. Initialize I2C (MPU6050)
+    // 3. I2C, MPU6050.
     let mut i2c_config = I2cConfig::default();
     i2c_config.frequency = Hertz(100_000);
 
     let i2c = I2c::new(
-        p.I2C1, p.PB6, p.PB7, Irqs, p.GPDMA1_CH0, p.GPDMA1_CH1, i2c_config,
+        p.I2C1,
+        p.PB6,
+        p.PB7,
+        Irqs,
+        p.GPDMA1_CH0,
+        p.GPDMA1_CH1,
+        i2c_config,
     );
 
     let mut sensor = match Mpu6050::new(i2c, Address::default()) {
@@ -110,6 +123,7 @@ async fn main(_spawner: Spawner) {
 
     let mut delay = Delay;
     let _ = tx.write(b"Loading DMP Firmware...\r\n").await;
+
     match sensor.initialize_dmp(&mut delay) {
         Ok(_) => {
             info!("DMP Firmware Loaded!");
@@ -124,7 +138,7 @@ async fn main(_spawner: Spawner) {
     info!("Initialization complete. Starting concurrent loops...");
 
     // ==========================================
-    // LOOP 1: BLUETOOTH RECEIVER
+    // LOOP 1: Bluetooth receiver.
     // ==========================================
     let receiver_loop = async {
         let mut buf = [0u8; 1];
@@ -137,7 +151,7 @@ async fn main(_spawner: Spawner) {
     };
 
     // ==========================================
-    // LOOP 2: LQR CONTROL
+    // LOOP 2: LQR control.
     // ==========================================
     let control_loop = async {
         let mut ticker = Ticker::every(Duration::from_millis(config::CONTROL_PERIOD_MS));
@@ -147,16 +161,24 @@ async fn main(_spawner: Spawner) {
         let mut motor_forward = true;
         let mut current_hz: u32 = 0;
 
-        // --- NEW: State trackers for Buzzer triggers ---
-        // --- Buzzer State Trackers ---
+        // Buzzer / state tracking.
         let mut is_calibrated = false;
-        let mut has_fallen = false;
+        let mut fall_latched = false;
+        let mut was_balancing = false;
+
+        // Accelerometer is read at reduced rate to avoid adding I2C jitter
+        // to the 200 Hz balance loop.
+        let mut accel_divider: u8 = 0;
+        let mut ax: i16 = 0;
+        let mut ay: i16 = 0;
+        let mut az: i16 = 0;
 
         loop {
             ticker.next().await;
 
             let mut latest_ypr: Option<YawPitchRoll> = None;
 
+            // Read all available DMP packets and keep only the newest one.
             if let Ok(mut len) = sensor.get_fifo_count() {
                 let mut fifo_buf = [0u8; 28];
 
@@ -167,46 +189,59 @@ async fn main(_spawner: Spawner) {
                             latest_ypr = Some(YawPitchRoll::from(quat));
                         }
                     }
+
                     len -= 28;
                 }
             }
 
             let v_ref_mps = velocity_reference_mps();
 
-            let mut ax: i16 = 0;
-            let mut ay: i16 = 0;
-            let mut az: i16 = 0;
-
             if let Some(ref ypr) = latest_ypr {
-                if let Ok(accel) = sensor.accel() {
-                    ax = accel.x();
-                    ay = accel.y();
-                    az = accel.z();
+                // Current balancing axis.
+                // If your robot balances using pitch, change this to ypr.pitch.
+                let theta_rad = ypr.roll as f32;
+
+                // Read raw accelerometer only every 10 control ticks.
+                // At 5 ms/tick, this is every 50 ms = 20 Hz.
+                accel_divider = accel_divider.wrapping_add(1);
+
+                if accel_divider >= 10 {
+                    accel_divider = 0;
+
+                    if let Ok(accel) = sensor.accel() {
+                        ax = accel.x();
+                        ay = accel.y();
+                        az = accel.z();
+                    }
                 }
 
-                // --- NEW: Trigger calibration and fall beeps ---
-                let theta_rad = ypr.roll as f32;
-                
-                // 1. Ready to use: R is between -0.05 and 0.05
+                // Upright/calibrated beep.
                 if !is_calibrated && theta_rad >= -0.05 && theta_rad <= 0.05 {
                     is_calibrated = true;
-                    has_fallen = false; // Reset fall state so it can fall again
+                    fall_latched = false;
                     BUZZER_CMD.store(2, Ordering::Relaxed);
-                    info!("Robot calibrated (upright)!");
+                    info!("Robot calibrated upright.");
                 }
 
-                // 2. Robot Falls: R is > 0.7 or < -0.7
-                if !has_fallen && theta_rad.abs() > 0.70 {
-                    has_fallen = true;
-                    is_calibrated = false; // Reset calibration so it can recalibrate when picked up
+                // Fall beep.
+                if !fall_latched && theta_rad.abs() > config::FALL_LIMIT_RAD {
+                    fall_latched = true;
+                    is_calibrated = false;
                     BUZZER_CMD.store(3, Ordering::Relaxed);
-                    info!("Robot fell!");
+                    info!("Robot fell.");
                 }
 
+                // Publish telemetry even if balance is disabled.
                 update_telem(
-                    ypr.yaw as f32, ypr.pitch as f32, ypr.roll as f32,
-                    ax, ay, az,
-                    0.0, v_ref_mps, balance_enabled(),
+                    ypr.yaw as f32,
+                    ypr.pitch as f32,
+                    ypr.roll as f32,
+                    ax,
+                    ay,
+                    az,
+                    0.0,
+                    v_ref_mps,
+                    balance_enabled(),
                 );
             }
 
@@ -215,15 +250,24 @@ async fn main(_spawner: Spawner) {
                     continue;
                 };
 
+                // Current balancing axis.
+                // If your robot balances using pitch, change this to ypr.pitch.
                 let theta_rad = ypr.roll as f32;
 
                 match lqr.step(theta_rad, v_ref_mps) {
                     Some(v_cmd_mps) => {
                         update_telem(
-                            ypr.yaw as f32, ypr.pitch as f32, ypr.roll as f32,
-                            ax, ay, az,
-                            v_cmd_mps, v_ref_mps, true,
+                            ypr.yaw as f32,
+                            ypr.pitch as f32,
+                            ypr.roll as f32,
+                            ax,
+                            ay,
+                            az,
+                            v_cmd_mps,
+                            v_ref_mps,
+                            true,
                         );
+
                         velocity_to_motor_command(v_cmd_mps)
                     }
                     None => {
@@ -233,36 +277,51 @@ async fn main(_spawner: Spawner) {
                 }
             } else {
                 lqr.reset();
-                let cmd = motor_cmd();
-                match cmd {
-                    1 => MotorCommand::Run { forward: true, step_hz: 4000 },
-                    2 => MotorCommand::Run { forward: false, step_hz: 4000 },
+
+                match motor_cmd() {
+                    1 => MotorCommand::Run {
+                        forward: true,
+                        step_hz: 4000,
+                    },
+                    2 => MotorCommand::Run {
+                        forward: false,
+                        step_hz: 4000,
+                    },
                     _ => MotorCommand::DisableDrivers,
                 }
             };
 
             match motor_command {
                 MotorCommand::DisableDrivers => {
-                    en_motors.set_high(); 
+                    en_motors.set_high();
+
                     if motor_running {
                         pwm.disable(Channel::Ch2);
                         pwm.disable(Channel::Ch3);
                         motor_running = false;
                     }
+
                     current_hz = 0;
                 }
                 MotorCommand::StopPulses => {
+                    // Keep drivers enabled for holding torque, but stop step pulses.
                     en_motors.set_low();
+
                     if motor_running {
                         pwm.disable(Channel::Ch2);
                         pwm.disable(Channel::Ch3);
                         motor_running = false;
                     }
+
                     current_hz = 0;
                 }
-                MotorCommand::Run { forward, step_hz: target_hz } => {
+                MotorCommand::Run {
+                    forward,
+                    step_hz: target_hz,
+                } => {
                     en_motors.set_low();
 
+                    // If direction changes, stop pulses briefly before changing DIR.
                     if motor_running && forward != motor_forward {
                         pwm.disable(Channel::Ch2);
                         pwm.disable(Channel::Ch3);
@@ -273,23 +332,38 @@ async fn main(_spawner: Spawner) {
                     if forward != motor_forward || !motor_running {
                         motor_forward = forward;
 
-                        let left_fwd  = forward ^ config::INVERT_LEFT_MOTOR;
+                        let left_fwd = forward ^ config::INVERT_LEFT_MOTOR;
                         let right_fwd = forward ^ config::INVERT_RIGHT_MOTOR;
 
-                        if left_fwd  { dir_left.set_high();  } else { dir_left.set_low();  }
-                        if right_fwd { dir_right.set_low();  } else { dir_right.set_high(); }
+                        if left_fwd {
+                            dir_left.set_high();
+                        } else {
+                            dir_left.set_low();
+                        }
+
+                        // Kept from your working direction logic.
+                        // If the right motor is not mirrored on your chassis,
+                        // this may need to be inverted.
+                        if right_fwd {
+                            dir_right.set_low();
+                        } else {
+                            dir_right.set_high();
+                        }
 
                         embassy_time::block_for(Duration::from_micros(2));
                     }
 
                     let new_hz = if current_hz < target_hz {
-                        (current_hz + config::ACCEL_STEP_HZ).min(target_hz)
+                        current_hz
+                            .saturating_add(config::ACCEL_STEP_HZ)
+                            .min(target_hz)
                     } else {
                         target_hz
                     };
 
                     if new_hz != current_hz || !motor_running {
                         current_hz = new_hz;
+
                         pwm.set_frequency(Hertz(current_hz));
 
                         let max_duty = pwm.get_max_duty();
@@ -305,20 +379,20 @@ async fn main(_spawner: Spawner) {
                 }
             }
 
-            // --- NEW: Trigger stop single-beep ---
-            // If it was balancing on the last tick, but isn't anymore
-            // (either via App Command 'X' or because it fell over).
+            // Stop beep if balance was active and now is not active.
             let current_balance = balance_enabled();
-            if has_fallen && !current_balance {
+
+            if was_balancing && !current_balance {
                 BUZZER_CMD.store(1, Ordering::Relaxed);
-                info!("Robot balance stopped!");
+                info!("Robot balance stopped.");
             }
-            has_fallen = current_balance;
+
+            was_balancing = current_balance;
         }
     };
 
     // ==========================================
-    // LOOP 3: TELEMETRY 
+    // LOOP 3: Telemetry.
     // ==========================================
     let telemetry_loop = async {
         let mut uart_buf = UartBuf::new();
@@ -330,10 +404,19 @@ async fn main(_spawner: Spawner) {
             let t = read_telem();
 
             uart_buf.clear();
+
             let _ = core::write!(
                 &mut uart_buf,
-                "Y: {:.2}, P: {:.2}, R: {:.2} | Ax: {}, Ay: {}, Az: {}\r\n",
-                t.yaw_rad, t.pitch_rad, t.roll_rad, t.ax, t.ay, t.az
+                "Y:{:.2},P:{:.2},R:{:.2}|Ax:{},Ay:{},Az:{}|Vc:{:.2},Vr:{:.2},B:{}\r\n",
+                t.yaw_rad,
+                t.pitch_rad,
+                t.roll_rad,
+                t.ax,
+                t.ay,
+                t.az,
+                t.v_cmd_mps,
+                t.v_ref_mps,
+                t.balanced
             );
 
             let _ = tx.write(uart_buf.as_slice()).await;
@@ -341,46 +424,51 @@ async fn main(_spawner: Spawner) {
     };
 
     // ==========================================
-    // LOOP 4: BUZZER (Async so it never blocks LQR)
+    // LOOP 4: Buzzer.
     // ==========================================
     let buzzer_loop = async {
-        // NOTE: If your buzzer beeps when set to Low, swap `set_high` and `set_low`!
+        // If your buzzer is active-low, swap set_high and set_low.
         let mut buzzer = Output::new(p.PC6, Level::Low, Speed::Low);
 
-        // Requirement 1: Beep once at Init (150ms)
+        // Beep once at init.
         buzzer.set_high();
         Timer::after(Duration::from_millis(150)).await;
         buzzer.set_low();
 
         loop {
-            // Read and consume the command
             let cmd = BUZZER_CMD.swap(0, Ordering::Relaxed);
-            
+
             match cmd {
+                1 => {
+                    // Stop beep: one short beep.
+                    buzzer.set_high();
+                    Timer::after(Duration::from_millis(150)).await;
+                    buzzer.set_low();
+                }
                 2 => {
-                    // Requirement 2: Ready / Calibration Beep (Two short bips)
+                    // Ready/calibrated beep: two short beeps.
                     buzzer.set_high();
                     Timer::after(Duration::from_millis(100)).await;
                     buzzer.set_low();
+
                     Timer::after(Duration::from_millis(100)).await;
+
                     buzzer.set_high();
                     Timer::after(Duration::from_millis(100)).await;
                     buzzer.set_low();
                 }
                 3 => {
-                    // Requirement 3: Fall Beep (One long bip - 1 full second)
+                    // Fall beep: one long beep.
                     buzzer.set_high();
                     Timer::after(Duration::from_millis(1000)).await;
                     buzzer.set_low();
                 }
                 _ => {}
             }
-            
-            // Poll command every 50ms (yielding back to other tasks)
+
             Timer::after(Duration::from_millis(50)).await;
         }
     };
 
-    // Run all 4 loops concurrently
     join4(control_loop, receiver_loop, telemetry_loop, buzzer_loop).await;
 }
